@@ -1,0 +1,187 @@
+/* Container must be relative to allow absolute positioning of UI */
+#cesiumContainer {
+    width: 100%;
+    height: 100vh;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+}
+
+.cesium-panel {
+    position: absolute;
+    top: 20px;
+    left: 20px;
+    z-index: 1000;
+    background: rgba(255, 255, 255, 0.9);
+    padding: 15px;
+    border-radius: 8px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    width: 240px;
+    font-family: sans-serif;
+}
+
+.legend {
+    top: auto;
+    bottom: 40px;
+    right: 20px;
+    left: auto;
+    width: 200px;
+}
+
+.section-label {
+    display: block;
+    font-weight: bold;
+    font-size: 12px;
+    color: #444;
+    margin-bottom: 8px;
+    letter-spacing: 1px;
+}
+
+.panel-section {
+    margin-bottom: 20px;
+}
+
+.button-group {
+    display: flex;
+    gap: 10px;
+}
+
+.toggle-btn {
+    flex: 1;
+    padding: 10px;
+    border: 1px solid #ccc;
+    background: #fff;
+    cursor: pointer;
+    border-radius: 4px;
+    transition: all 0.2s;
+    font-weight: bold;
+}
+
+.toggle-btn.active {
+    background: #2a7fff;
+    color: white;
+    border-color: #1a5fb4;
+}
+
+.custom-select {
+    width: 100%;
+    padding: 8px;
+    border-radius: 4px;
+    border: 1px solid #ccc;
+}
+
+/* Legend Styling */
+.legend-item {
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    margin-top: 5px;
+}
+
+.line {
+    width: 20px;
+    height: 3px;
+    margin-right: 8px;
+    display: inline-block;
+}
+
+.line.wms {
+    background: yellow;
+}
+
+/* ── New building box indicators ── */
+.box {
+    width: 14px;
+    height: 14px;
+    margin-right: 8px;
+    display: inline-block;
+    border-radius: 2px;
+    flex-shrink: 0;
+}
+
+.box.allocated {
+    background: rgba(255, 0, 0, 0.5);
+    border: 1px solid red;
+}
+
+.box.covered {
+    background: rgba(0, 255, 0, 0.5);
+    border: 1px solid green;
+}
+
+.line.czml {
+    background: linear-gradient(to right, blue, red);
+}
+
+#transition-overlay {
+    position: absolute;
+    inset: 0;
+    background: #000;
+    z-index: 998;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.3s ease;
+}
+
+#transition-overlay.visible {
+    opacity: 1;
+    pointer-events: all;
+}
+
+/* Apply the same style to date input for consistency */
+input[type="date"].custom-select {
+    width: 93%;
+    /* Adjust slightly to account for the calendar icon padding */
+    padding: 8px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    background: #fff;
+    font-family: inherit;
+    cursor: pointer;
+}
+
+/* Optional: change the color of the calendar icon to match UI */
+input[type="date"]::-webkit-calendar-picker-indicator {
+    cursor: pointer;
+    filter: invert(0.5);
+    /* Makes it a subtle grey */
+}
+
+/* Stats Overlay - Centered */
+.stats-overlay {
+    position: absolute;
+    top: 20px;            /* Distance from the top */
+    left: 50%;           /* Move to the horizontal center */
+    transform: translateX(-50%); /* Offset by half its own width to center perfectly */
+    
+    display: flex;
+    gap: 30px;
+    background: #edffff;
+    padding: 12px 25px;
+    border-radius: 50px; /* Rounded pill shape looks great in the center */
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    min-width: 450px;
+    box-shadow: 0 4px 15px rgba(0, 0, 0, 0.5);
+    z-index: 100;        /* Ensure it stays above other map elements */
+}
+
+.stat-item {
+    flex: 1;
+    text-align: center;
+    border-right: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.stat-item:last-child {
+    border-right: none; /* Remove border from the last item */
+}
+
+/* Adjusting the progress bar to fit the pill shape */
+.progress-container {
+    height: 10px;
+    background: #edffff;
+    border-radius: 5px;
+    margin-top: 4px;
+    width: 80%;
+    margin-left: auto;
+    margin-right: auto;
+}

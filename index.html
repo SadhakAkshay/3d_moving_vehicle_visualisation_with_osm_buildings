@@ -1,0 +1,676 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <script src="https://cesium.com/downloads/cesiumjs/releases/1.140/Build/Cesium/Cesium.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@turf/turf@7/turf.min.js"></script>
+    <link href="https://cesium.com/downloads/cesiumjs/releases/1.140/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <div id="cesiumContainer"></div>
+
+    <div id="ui-overlay" class="cesium-panel">
+        <div class="panel-section">
+            <label class="section-label">VIEW MODE</label>
+            <div class="button-group">
+                <button id="btn-2d" class="toggle-btn active" onclick="setViewMode('2D')">
+                    <span class="icon">🗺️</span> 2D
+                </button>
+                <button id="btn-3d" class="toggle-btn" onclick="setViewMode('3D')">
+                    <span class="icon">🌍</span> 3D
+                </button>
+            </div>
+        </div>
+
+        <div id="camera-options" class="panel-section" style="display: none;">
+            <label class="section-label">3D CAMERA MODE</label>
+            <div class="button-group sub-group">
+                <button id="btn-fixed" class="toggle-btn active" onclick="setCameraMode('fixed')">
+                    Fixed View
+                </button>
+                <button id="btn-rotating" class="toggle-btn" onclick="setCameraMode('rotating')">
+                    Rotating
+                </button>
+            </div>
+        </div>
+
+        <div class="panel-section">
+            <label class="section-label" for="route-select">VAN ID</label>
+            <select id="route-select" class="custom-select" onchange="handleRouteChange(this.value)">
+                <option value="1">Van 1</option>
+                <option value="2">Van 2</option>
+                <option value="3">Van 3</option>
+            </select>
+        </div>
+
+        <div class="panel-section">
+            <label class="section-label" for="date-select">DATE</label>
+            <input type="date" id="date-select" class="custom-select" onchange="handleDateChange(this.value)">
+        </div>
+    </div>
+
+    <div id="stats-panel" class="cesium-panel stats-overlay">
+        <div class="stat-item">
+            <label>Speed</label>
+            <div class="value"><span id="stat-speed">0</span></div>
+        </div>
+        <div class="stat-item">
+            <label>Distance</label>
+            <div class="value"><span id="stat-distance">0.0</span></div>
+        </div>
+        <div class="stat-item">
+            <label>Area Covered</label>
+            <div class="progress-container">
+                <div id="area-progress-bar" class="progress-fill" style="width: 0%"></div>
+                <span id="stat-area"></span>
+            </div>
+        </div>
+    </div>
+
+    <div id="map-legend" class="cesium-panel legend">
+        <label class="section-label">LEGEND</label>
+        <div class="legend-item">
+            <span class="line wms"></span> Allocated Route
+        </div>
+        <div class="legend-item">
+            <span class="box allocated"></span> Allocated Buildings
+        </div>
+        <div class="legend-item">
+            <span class="box covered"></span> Covered Buildings
+        </div>
+    </div>
+
+    <script>
+
+        Cesium.Ion.defaultAccessToken = '';
+
+        // ─── State ────────────────────────────────────────────────────────────────
+        let longitude;
+        let latitude;
+        let activeMode = '2D';
+        let heading_angle;
+        let selectedDate;
+        let activeRoute;
+
+        let minimumLongitude, maximumLongitude, minimumLatitude, maximumLatitude;
+
+        // Building highlight state
+        let osmBuildings = null;
+        let routeBbox = null;  // full route bounding box → RED buildings
+        let coveredPolygon = null;  // turf polygon (linestring buffer) → GREEN buildings
+        let visitedCoords = [];    // accumulates [lon, lat] as vehicle moves
+
+        // Corridor half-width in meters on each side of the path
+        const BUFFER_WIDTH_METERS = 30;
+
+        const RED_COLOR = Cesium.Color.RED.withAlpha(0.5);
+        const GREEN_COLOR = Cesium.Color.GREEN.withAlpha(0.5);
+        const WHITE_COLOR = Cesium.Color.WHITE;
+
+        // Distance / speed state
+        let lastPosition = null;
+        let traveledDistance = 0;
+        let totalDistance = 0;
+        let lastComputedTime = 0;
+        let lastBufferTime = 0;
+        let lastAnimationTime = null;
+        const THROTTLE_MS = 300;
+        const BUFFER_INTERVAL = 300;
+        let routeBufferPolygon = null;
+        let dustbinEntities = [];
+
+        // Active CZML datasource
+        let activeCzmlDs = null;
+
+        // ─── Viewer ───────────────────────────────────────────────────────────────
+        const viewer = new Cesium.Viewer('cesiumContainer', {
+            terrain: Cesium.Terrain.fromWorldTerrain(),
+            baseLayerPicker: false,
+            shouldAnimate: true,
+        });
+
+        // ─── Imagery layers ───────────────────────────────────────────────────────
+        let paramlayer = new Cesium.ImageryLayer(
+            new Cesium.WebMapServiceImageryProvider({
+                url: "http://localhost:8080/geoserver/practise/wms",
+                layers: "practise:cesium_road",
+                parameters: {
+                    transparent: true,
+                    format: "image/png",
+                    viewparams: "id:1",
+                },
+            }),
+        );
+
+        let paramCoveredlayer = null;
+
+        const DEFAULT_LON = 73.83776194544345;
+        const DEFAULT_LAT = 19.953943542912157;
+        const DEFAULT_HEADING = 307.4576335449237;
+
+        // ─── Camera helpers ───────────────────────────────────────────────────────
+        function flyTo2D(lon, lat, height) {
+            viewer.camera.flyTo({
+                destination: Cesium.Cartesian3.fromDegrees(lon, lat, height ?? 4784.584578042495),
+            });
+        }
+
+        function flyTo3D(lon, lat, heading) {
+            viewer.camera.flyTo({
+                destination: Cesium.Cartesian3.fromDegrees(lon, lat, 650),
+                orientation: {
+                    heading: Cesium.Math.toRadians(heading),
+                    pitch: Cesium.Math.toRadians(-15),
+                    roll: Cesium.Math.toRadians(0.00008945152153792866),
+                }
+            });
+        }
+
+        function getRoadsidePoint(stopPoint, localBearing, features, index, offsetMeters = 8) {
+            const [sLon, sLat] = stopPoint.geometry.coordinates;
+
+            // Two candidates — left (−90°) and right (+90°) of local road direction
+            const leftBearing = (localBearing - 90 + 360) % 360;
+            const rightBearing = (localBearing + 90) % 360;
+
+            const leftPt = turf.destination(stopPoint, offsetMeters, leftBearing, { units: 'meters' });
+            const rightPt = turf.destination(stopPoint, offsetMeters, rightBearing, { units: 'meters' });
+
+            // Count how many route coords are within 15m of each candidate
+            // Whichever side has FEWER nearby route points = roadside
+            let leftCount = 0;
+            let rightCount = 0;
+
+            features.forEach(f => {
+                const pt = turf.point(f.geometry.coordinates);
+                if (turf.distance(leftPt, pt, { units: 'meters' }) < 15) leftCount++;
+                if (turf.distance(rightPt, pt, { units: 'meters' }) < 15) rightCount++;
+            });
+
+            return leftCount <= rightCount ? leftPt : rightPt;
+        }
+
+        function placeDustbins(features) {
+            features.forEach((feature, index) => {
+                if (!feature.properties.wait || feature.properties.wait === 0) return;
+
+                const [lon, lat] = feature.geometry.coordinates;
+                const stopPoint = turf.point([lon, lat]);
+
+                // Get local road bearing from previous point (or next if first point)
+                const refFeature = features[index - 1] ?? features[index + 1];
+                const [rLon, rLat] = refFeature.geometry.coordinates;
+
+                // Local bearing = direction of travel at this exact point
+                const localBearing = turf.bearing(turf.point([rLon, rLat]), stopPoint);
+
+                // Get roadside point using neighbour heuristic
+                const roadsidePt = getRoadsidePoint(stopPoint, localBearing, features, index, 8);
+                const [newLon, newLat] = roadsidePt.geometry.coordinates;
+
+                const entity = viewer.entities.add({
+                    position: Cesium.Cartesian3.fromDegrees(newLon, newLat),
+                    model: {
+                        uri: 'dustbin.glb',
+                        scale: 2.0,           // ← reduced from 2.0
+                        minimumPixelSize: 35, // ← reduced from 64
+                        heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+                    },
+                });
+
+                dustbinEntities.push(entity);
+            });
+        }
+
+        // ─── View mode switch ─────────────────────────────────────────────────────
+        function setViewMode(mode) {
+            const lon = longitude ?? DEFAULT_LON;
+            const lat = latitude ?? DEFAULT_LAT;
+            const heading = heading_angle ?? DEFAULT_HEADING;
+
+            activeMode = mode;
+
+            if (mode === '2D') {
+                document.getElementById('btn-2d').classList.add('active');
+                document.getElementById('btn-3d').classList.remove('active');
+                document.getElementById('camera-options').style.display = 'none';
+
+                // Release entity tracking so we control camera manually
+                viewer.trackedEntity = undefined;
+                flyTo2D(lon, lat);
+
+            } else {
+                document.getElementById('btn-2d').classList.remove('active');
+                document.getElementById('btn-3d').classList.add('active');
+                document.getElementById('camera-options').style.display = 'none';
+
+                flyTo3D(lon, lat, heading);
+            }
+        }
+
+        // ─── Route change ─────────────────────────────────────────────────────────
+        function handleRouteChange(routeId) {
+            activeRoute = routeId;
+
+            if (activeCzmlDs) {
+                viewer.dataSources.remove(activeCzmlDs, true);
+                activeCzmlDs = null;
+            }
+
+            viewer.trackedEntity = undefined;
+            viewer.clock.shouldAnimate = false;
+
+            // Reset all stat displays
+            document.getElementById('stat-speed').textContent = '0';
+            document.getElementById('stat-distance').textContent = '0.0';
+            const bar = document.getElementById('area-progress-bar');
+            bar.style.width = '0%';
+            bar.textContent = '0%';
+
+            // Reset all computation state
+            totalDistance = 0;
+            lastComputedTime = 0;
+            fromPoint = null;
+            dustbinEntities.forEach(e => viewer.entities.remove(e));
+            dustbinEntities = [];
+            _resetCoveredState();
+
+            fetch(`http://localhost:8000/route-centroid/${routeId}`)
+                .then(r => r.json())
+                .then(result => {
+                    console.log(result)
+                    longitude = result.longitude;
+                    latitude = result.latitude;
+                    heading_angle = result.heading_angle;
+
+                    const routeGeojson = result.route_geojson; // MultiLineString GeoJSON
+
+                    const buffered = turf.buffer(routeGeojson, BUFFER_WIDTH_METERS, { units: 'meters' });
+
+                    const bbox = turf.bbox(buffered);
+                    routeBbox = {
+                        minLon: bbox[0],
+                        minLat: bbox[1],
+                        maxLon: bbox[2],
+                        maxLat: bbox[3],
+                    };
+
+                    routeBufferPolygon = buffered;
+
+                    // Wipe any previous green corridor
+                    _resetCoveredState();
+
+                    // Swap WMS layer
+                    viewer.imageryLayers.remove(paramlayer);
+                    paramlayer = new Cesium.ImageryLayer(
+                        new Cesium.WebMapServiceImageryProvider({
+                            url: "http://localhost:8080/geoserver/practise/wms",
+                            layers: "practise:cesium_road",
+                            parameters: {
+                                transparent: true,
+                                format: "image/png",
+                                viewparams: `id:${routeId}`,
+                            },
+                        }),
+                    );
+                    viewer.imageryLayers.add(paramlayer);
+
+                    // Repaint: route area RED, everything else WHITE
+                    // _restyleAllLoadedTiles();
+
+                    // if (activeMode === '2D') {
+                    //     flyTo2D(longitude, latitude);
+                    // } else {
+                    //     flyTo3D(longitude, latitude, heading_angle);
+                    // }
+
+                    if (activeMode === '2D') {
+                        viewer.camera.flyTo({
+                            destination: Cesium.Cartesian3.fromDegrees(longitude, latitude, 4784.584578042495),
+                            complete: function () {
+                                // Camera has landed — tiles for new location are now loading/visible
+                                _restyleAllLoadedTiles();
+                            }
+                        });
+                    } else {
+                        viewer.camera.flyTo({
+                            destination: Cesium.Cartesian3.fromDegrees(longitude, latitude, 650),
+                            orientation: {
+                                heading: Cesium.Math.toRadians(heading_angle),
+                                pitch: Cesium.Math.toRadians(-15),
+                                roll: Cesium.Math.toRadians(0.00008945152153792866),
+                            },
+                            complete: function () {
+                                _restyleAllLoadedTiles();
+                            }
+                        });
+                    }
+
+                    if (selectedDate) {
+                        handleDateChange(selectedDate);
+                    }
+                })
+                .catch(err => console.error('route-centroid error:', err));
+        }
+
+        // ─── Reset covered state ──────────────────────────────────────────────────
+        function _resetCoveredState() {
+            coveredPolygon = null;
+            visitedCoords = [];
+            lastBufferTime = 0;
+            lastAnimationTime = null;
+        }
+
+        // ─── Building colour logic ────────────────────────────────────────────────
+        /**
+         * Colour decision per building centroid:
+         *
+         *   GREEN  → inside coveredPolygon  (vehicle passed through corridor)
+         *   RED    → inside routeBbox       (route area, not yet covered)
+         *   WHITE  → outside everything
+         *
+         * coveredPolygon is a proper road-shaped corridor polygon built by
+         * buffering the vehicle's actual travelled linestring with Turf.js.
+         * This means only buildings physically close to the road turn green —
+         * not a rectangle that covers unvisited areas.
+         */
+        function _colorForFeature(lon, lat) {
+            const pt = turf.point([lon, lat]);
+
+            // GREEN — vehicle has passed through here
+            if (coveredPolygon && turf.booleanPointInPolygon(pt, coveredPolygon)) {
+                return GREEN_COLOR;
+            }
+
+            // RED — inside the route corridor but not yet covered
+            if (routeBufferPolygon && turf.booleanPointInPolygon(pt, routeBufferPolygon)) {
+                return RED_COLOR;
+            }
+
+            return WHITE_COLOR;
+        }
+
+        function _applyStyleToTile(tile) {
+            if (!tile.contentReady) return;
+            const n = tile.content.featuresLength;
+            for (let i = 0; i < n; i++) {
+                const f = tile.content.getFeature(i);
+                const lon = f.getProperty('cesium#longitude');
+                const lat = f.getProperty('cesium#latitude');
+                if (lon == null || lat == null) continue;
+                f.color = _colorForFeature(lon, lat);
+            }
+        }
+
+        // Toggle show to force Cesium to re-fire tileVisible for all visible tiles
+        function _restyleAllLoadedTiles() {
+            if (!osmBuildings) return;
+            osmBuildings.show = false;
+            osmBuildings.show = true;
+        }
+
+        // Fires for every tile that becomes visible
+        function _onTileVisible(tile) {
+            _applyStyleToTile(tile);
+        }
+
+        // ─── Turf helpers ─────────────────────────────────────────────────────────
+        function initDistanceCalculator(features) {
+            const [lon, lat] = features[0].geometry.coordinates;
+            lastPosition = turf.point([lon, lat]);  // seed with start point
+            traveledDistance = 0;                        // reset odometer
+            visitedCoords = [[lon, lat]];
+        }
+
+        function computeTotalDistance(features) {
+            totalDistance = 0;
+            for (let i = 0; i < features.length - 1; i++) {
+                const from = turf.point(features[i].geometry.coordinates);
+                const to = turf.point(features[i + 1].geometry.coordinates);
+                totalDistance += turf.distance(from, to, { units: 'meters' });
+            }
+        }
+
+        function getOdometerDistance(lon, lat) {
+            const now = Date.now();
+            if (now - lastComputedTime < THROTTLE_MS) return null;
+            lastComputedTime = now;
+
+            if (!lastPosition) return null;
+
+            const currentPoint = turf.point([lon, lat]);
+
+            // Distance from last recorded position to current position
+            const segment = turf.distance(lastPosition, currentPoint, { units: 'meters' });
+
+            // Only accumulate if vehicle actually moved (filter GPS jitter)
+            if (segment > 0.5) {
+                traveledDistance += segment;
+                lastPosition = currentPoint;  // current becomes next "from"
+            }
+
+            return traveledDistance;
+        }
+
+        function getProgressPercentage(currentDistance) {
+            if (!totalDistance || totalDistance === 0) return 0;
+            return Math.min((currentDistance / totalDistance) * 100, 100);
+        }
+
+        function getSpeedWithTolerance(features, lon, lat, tolerance = 0.00001) {
+            for (let i = 0; i < features.length - 1; i++) {
+                const [fLon, fLat] = features[i].geometry.coordinates;
+                if (Math.abs(fLon - lon) < tolerance && Math.abs(fLat - lat) < tolerance) {
+                    const current = features[i];
+                    const next = features[i + 1];
+                    if (!next) return null;
+                    const dist = turf.distance(
+                        turf.point(current.geometry.coordinates),
+                        turf.point(next.geometry.coordinates),
+                        { units: 'meters' }
+                    );
+                    const t1 = new Date(current.properties.timestamp).getTime();
+                    const t2 = new Date(next.properties.timestamp).getTime();
+                    const timeDiff = (t2 - t1) / 1000;
+                    if (timeDiff === 0) return 0;
+                    return (dist / timeDiff) * 3.6;
+                }
+            }
+            return null;
+        }
+
+        /**
+         * updateCoveredPolygon — the key function for proper green highlighting.
+         *
+         * Every BUFFER_INTERVAL ms:
+         *   1. Appends current vehicle position to visitedCoords[]
+         *   2. Builds a turf.lineString from ALL visited points so far
+         *   3. Buffers that linestring by BUFFER_WIDTH_METERS
+         *      → produces a capsule-shaped corridor polygon hugging the actual road
+         *   4. Stores it in coveredPolygon
+         *   5. Triggers tile repaint
+         *
+         * Because we check turf.booleanPointInPolygon(buildingCentroid, coveredPolygon)
+         * in _colorForFeature, only buildings physically within ~30m of the road
+         * the vehicle actually travelled turn green.
+         */
+        function updateCoveredPolygon(lon, lat) {
+            const now = Date.now();
+            if (now - lastBufferTime < BUFFER_INTERVAL) return;
+            lastBufferTime = now;
+
+            // Avoid duplicate consecutive points
+            const last = visitedCoords[visitedCoords.length - 1];
+            if (!last || last[0] !== lon || last[1] !== lat) {
+                visitedCoords.push([lon, lat]);
+            }
+
+            // Need ≥ 2 distinct points to form a linestring
+            if (visitedCoords.length < 2) return;
+
+            try {
+                const line = turf.lineString(visitedCoords);
+                const buffered = turf.buffer(line, BUFFER_WIDTH_METERS, { units: 'meters' });
+
+                if (buffered && buffered.geometry) {
+                    coveredPolygon = buffered;
+                    _restyleAllLoadedTiles();
+                }
+            } catch (e) {
+                // Guard against degenerate geometries
+            }
+        }
+
+        // ─── Date change / CZML loading ───────────────────────────────────────────
+        function handleDateChange(date) {
+            selectedDate = date;
+            if (!selectedDate || !activeMode || !activeRoute) return;
+
+            paramCoveredlayer = new Cesium.ImageryLayer(
+                new Cesium.WebMapServiceImageryProvider({
+                    url: "http://localhost:8080/geoserver/practise/wms",
+                    layers: "practise:covered_road",
+                    parameters: {
+                        transparent: true,
+                        format: "image/png",
+                        viewparams: `id:${activeRoute}; date1:${selectedDate}`,
+                    },
+                }),
+            );
+            //viewer.imageryLayers.add(paramCoveredlayer);
+
+            const myHeaders = new Headers();
+            myHeaders.append('Content-Type', 'application/json');
+
+            fetch('http://localhost:8000/generate-czml', {
+                method: 'POST',
+                headers: myHeaders,
+                body: JSON.stringify({ date: `'${selectedDate}'`, road_id: activeRoute }),
+            })
+                .then(r => r.json())
+                .then(result => {
+                    const czmlData = result.czml;
+                    const geojsonfeatures = result.geojson.features;
+
+                    // Reset all per-run state
+                    totalDistance = 0;
+                    lastComputedTime = 0;
+                    traveledDistance = 0;
+                    lastPosition = null;
+                    _resetCoveredState();
+
+                    computeTotalDistance(geojsonfeatures);
+                    initDistanceCalculator(geojsonfeatures);
+                    placeDustbins(geojsonfeatures);
+
+                    // Remove previous CZML datasource
+                    if (activeCzmlDs) {
+                        viewer.dataSources.remove(activeCzmlDs, true);
+                        activeCzmlDs = null;
+                    }
+
+                    Cesium.CzmlDataSource.load(czmlData).then(ds => {
+                        viewer.dataSources.add(ds);
+                        activeCzmlDs = ds;
+
+                        viewer.scene.postUpdate.addEventListener(function onPostUpdate(scene, time) {
+                            // Self-removing when datasource is replaced
+                            if (activeCzmlDs !== ds) {
+                                viewer.scene.postUpdate.removeEventListener(onPostUpdate);
+                                return;
+                            }
+
+                            const vehicleEntity = ds.entities.getById('vehicle');
+                            if (!vehicleEntity) return;
+
+                            const position = vehicleEntity.position.getValue(time);
+                            if (!Cesium.defined(position)) return;
+
+                            const cartographic = Cesium.Cartographic.fromCartesian(position);
+                            const curLon = Cesium.Math.toDegrees(cartographic.longitude);
+                            const curLat = Cesium.Math.toDegrees(cartographic.latitude);
+
+                            viewer.clock.shouldAnimate = true;
+
+                            vehicleEntity.orientation = new Cesium.VelocityOrientationProperty(vehicleEntity.position);
+                            vehicleEntity.model.heightReference = Cesium.HeightReference.CLAMP_TO_GROUND;
+
+                            // ── Detect CZML loop (clock jumped backwards) ──────
+                            const currentTimeMs = Cesium.JulianDate.toDate(time).getTime();
+                            if (lastAnimationTime !== null && currentTimeMs < lastAnimationTime) {
+                                // Animation looped — reset green corridor and odometer
+                                _resetCoveredState();
+                                _restyleAllLoadedTiles();
+
+                                // Reset odometer
+                                traveledDistance = 0;
+
+                                // Seed lastPosition with vehicle's current position at loop start
+                                lastPosition = turf.point([curLon, curLat]);
+
+                                // Re-seed visited coords for buffer
+                                visitedCoords = [[curLon, curLat]];
+                            }
+                            lastAnimationTime = currentTimeMs;
+
+                            // ── Stats ──────────────────────────────────────────
+                            const speed = getSpeedWithTolerance(geojsonfeatures, curLon, curLat);
+                            if (speed != null) {
+                                document.getElementById('stat-speed').textContent = speed.toFixed(2) + ' km/h';
+                            }
+
+                            const distance = getOdometerDistance(curLon, curLat);
+                            if (distance !== null) {
+                                document.getElementById('stat-distance').textContent = distance.toFixed(2) + ' m';
+
+                                const progress = getProgressPercentage(distance);
+                                const bar = document.getElementById('area-progress-bar');
+                                bar.style.width = progress.toFixed(2) + '%';
+                                bar.textContent = progress.toFixed(2) + '%';
+
+                                // ── Grow the road corridor polygon ─────────────
+                                updateCoveredPolygon(curLon, curLat);
+                            }
+
+                            // ── Camera ─────────────────────────────────────────
+                            if (activeMode === '3D') {
+                                viewer.trackedEntity = vehicleEntity;
+                            } else {
+                                viewer.trackedEntity = undefined;
+                                viewer.camera.setView({
+                                    destination: Cesium.Cartesian3.fromDegrees(curLon, curLat, 1000),
+                                });
+                            }
+                        });
+                    });
+                })
+                .catch(err => console.error('generate-czml error:', err));
+        }
+
+        // ─── Initial load ─────────────────────────────────────────────────────────
+        window.addEventListener('load', async () => {
+            // Default area → RED buildings on initial load
+            routeBbox = {
+                minLon: 73.82251409857068, maxLon: 73.82767205136636,
+                minLat: 19.961686018652937, maxLat: 19.965639194153276,
+            };
+
+            osmBuildings = await Cesium.createOsmBuildingsAsync();
+            viewer.scene.primitives.add(osmBuildings);
+            osmBuildings.tileVisible.addEventListener(_onTileVisible);
+
+            viewer.imageryLayers.add(paramlayer);
+
+            setViewMode('2D');
+            viewer.camera.flyTo({
+                destination: Cesium.Cartesian3.fromDegrees(73.82751204188182, 19.961686018652937, 4784.584578042495),
+            });
+        });
+
+    </script>
+</body>
+
+</html>
